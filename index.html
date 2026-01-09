@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="no">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IDM Query Builder</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 10px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 10px; max-width: 720px; }
+    textarea { width: 100%; min-height: 85px; font-family: Consolas, monospace; font-size: 13px; }
+    .small { color: #555; font-size: 12px; }
+    .error { color: #b00020; font-weight: bold; }
+    .ok { color: #1b5e20; }
+    button { padding: 7px 10px; cursor: pointer; }
+    .docs { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 4px; margin-top: 6px; }
+    .muted { color: #666; }
+    h3 { margin: 8px 0 6px 0; font-size: 13px; }
+
+    /* Top action bar */
+    .actionbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-start;
+      margin-bottom: 6px;
+    }
+    .actionbar .spacer { flex: 1 1 auto; }
+    .inline { display:flex; gap:6px; align-items:center; }
+
+    /* Manual copy fallback box (shown only if clipboard blocked) */
+    #copyFallback {
+      display: none;
+      width: 100%;
+      min-height: 60px;
+      margin-top: 6px;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+
+    <!-- Top-left controls (no scrolling needed) -->
+    <div class="actionbar">
+      <button id="generateBtn" type="button">Generer</button>
+      <button id="copyBtn" type="button" disabled>Kopier query</button>
+
+      <span class="spacer"></span>
+
+      <div id="msg" class="small"></div>
+    </div>
+
+    <!-- Fallback appears only when clipboard is blocked (e.g. embedded/iframe) -->
+    <textarea id="copyFallback" readonly></textarea>
+
+    <h3>1) Ordrenumre</h3>
+    <div class="small">Lim inn ordrenumre (én per linje, eller separert med komma/mellomrom).</div>
+    <textarea id="orders" placeholder="0009122978&#10;0020042421"></textarea>
+
+    <h3>2) Dokumenttyper</h3>
+    <div class="small">
+      <label class="inline">
+        <input type="checkbox" id="select_all">
+        Velg alle
+      </label>
+      <span class="muted">Velg én eller flere.</span>
+    </div>
+
+    <div id="docs" class="docs"></div>
+  </div>
+
+<script>
+  // -----------------------------
+  // Document types
+  // -----------------------------
+  // predicate:
+  //  - "eq"          -> @FIELD="ORDER"
+  //  - "like_prefix" -> @FIELD LIKE "ORDER%"
+  //  - "like_any"    -> @FIELD LIKE "%ORDER%"
+  const DOC_TYPES = {
+    HC:           { label: "HC",            path: "/M3_DeliveryDocument", predicate: "eq",         field: "M3_RIDN",      extra: '@M3_DOVA="HC"' },
+    ProductCV:    { label: "Product CV",    path: "/M3_DeliveryDocument", predicate: "eq",         field: "M3_RIDN",      extra: '@M3_DOVA="Product CV"' },
+    CMR:          { label: "CMR",           path: "/M3_DeliveryDocument", predicate: "eq",         field: "M3_RIDN",      extra: '@M3_DOVA="CMR"' },
+    DeliveryNote: { label: "Delivery Note", path: "/M3_DeliveryDocument", predicate: "eq",         field: "M3_RIDN",      extra: '@M3_DOVA="Delivery Note"' },
+
+    // ShipmentDocument (confirmed working syntax):
+    // /M3_DeliveryDocument[@displayName LIKE "0009122978%" AND @M3_DOVA="ShipmentDocument"]
+    ShipmentDocument: {
+      label: "ShipmentDocument",
+      path: "/M3_DeliveryDocument",
+      predicate: "like_prefix",
+      field: "displayName",
+      extra: '@M3_DOVA="ShipmentDocument"',
+    },
+
+    DeliveryDocument:  { label: "DeliveryDocument (alle)", path: "/M3_DeliveryDocument", predicate: "eq", field: "M3_RIDN", extra: "" },
+    PickingList:       { label: "Picking list",            path: "/M3_Picking_list",     predicate: "eq", field: "M3_RIDN", extra: "" },
+    CustomsInvoice:    { label: "CustomsInvoice",          path: "/M3_CustomsInvoice",   predicate: "eq", field: "M3_CUNO", extra: "" },
+    CustomerInvoice:   { label: "CustomerInvoice",         path: "/M3_CustomerInvoice",  predicate: "eq", field: "M3_ORNO", extra: "" },
+    OrderConfirmation: { label: "Orderconfirmation",        path: "/M3_OrderConfirmation", predicate: "eq", field: "M3_OrderNumber", extra: "" },
+  };
+
+  const UI_ORDER = [
+    "HC",
+    "ShipmentDocument",
+    "ProductCV",
+    "CMR",
+    "DeliveryNote",
+    "DeliveryDocument",
+    "PickingList",
+    "CustomsInvoice",
+    "CustomerInvoice",
+    "OrderConfirmation",
+  ];
+
+  const SORT_CLAUSE = 'SORTBY(@LASTCHANGEDTS DESCENDING)';
+
+  // -----------------------------
+  // Builder logic
+  // -----------------------------
+  const ORDER_RE = /^\d+$/;
+  let currentQueryFull = "";
+
+  function parseOrders(rawText) {
+    if (!rawText || !rawText.trim()) return [];
+    const parts = rawText.trim().split(/[,\s;]+/);
+    const orders = [];
+    const seen = new Set();
+
+    for (let p of parts) {
+      if (!p) continue;
+      p = p.trim();
+
+      if (p.includes('"') || p.includes("'")) {
+        throw new Error(`Ugyldig ordrenummer "${p}": anførselstegn er ikke tillatt.`);
+      }
+      if (!ORDER_RE.test(p)) {
+        throw new Error(`Ugyldig ordrenummer "${p}": må kun inneholde tall.`);
+      }
+      if (!seen.has(p)) {
+        seen.add(p);
+        orders.push(p);
+      }
+    }
+    return orders;
+  }
+
+  function buildOrPredicate(fieldName, orders, predicateType) {
+    if (!orders || orders.length === 0) throw new Error("Ingen ordrenumre angitt.");
+
+    if (predicateType === "like_prefix") {
+      if (orders.length === 1) return `@${fieldName} LIKE "${orders[0]}%"`;
+      return orders.map(o => `@${fieldName} LIKE "${o}%"`).join(" OR ");
+    }
+
+    if (predicateType === "like_any") {
+      if (orders.length === 1) return `@${fieldName} LIKE "%${orders[0]}%"`;
+      return orders.map(o => `@${fieldName} LIKE "%${o}%"`).join(" OR ");
+    }
+
+    // default: eq
+    if (orders.length === 1) return `@${fieldName}="${orders[0]}"`;
+    return orders.map(o => `@${fieldName}="${o}"`).join(" OR ");
+  }
+
+  function buildIdmQuery(orders, selectedDocKeys) {
+    if (!orders || orders.length === 0) throw new Error("Ingen ordrenumre angitt.");
+    const docKeys = (selectedDocKeys || []).filter(Boolean);
+    if (docKeys.length === 0) throw new Error("Ingen dokumenttyper valgt.");
+
+    const unknown = docKeys.filter(k => !(k in DOC_TYPES));
+    if (unknown.length) throw new Error(`Ukjent dokumenttype: ${unknown.join(", ")}`);
+
+    const blocks = [];
+    for (const key of docKeys) {
+      const dt = DOC_TYPES[key];
+      const base = buildOrPredicate(dt.field, orders, dt.predicate);
+      const predicate = dt.extra ? `(${base}) AND ${dt.extra}` : base;
+      blocks.push(`${dt.path}[${predicate}]`);
+    }
+
+    let query = blocks[0];
+    for (let i = 1; i < blocks.length; i++) {
+      query += "\n UNION\n " + blocks[i];
+    }
+    query += "\n " + SORT_CLAUSE;
+    return query;
+  }
+
+  // Keep as helper if you later re-add a compact option.
+  function getCompactText(s) {
+    return String(s || "").replace(/\s+/g, " ").trim();
+  }
+
+  // -----------------------------
+  // UI
+  // -----------------------------
+  function escapeHtml(s) {
+    return String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function setMessage(text, kind) {
+    const msg = document.getElementById("msg");
+    if (!text) { msg.innerHTML = ""; return; }
+    const cls = kind === "error" ? "error" : "ok";
+    msg.innerHTML = `<span class="${cls}">${escapeHtml(text)}</span>`;
+  }
+
+  function getSelectedDocs() {
+    const boxes = document.querySelectorAll('input[name="docs"]:checked');
+    return Array.from(boxes).map(b => b.value);
+  }
+
+  async function copyQuery() {
+    const text = currentQueryFull;
+
+    if (!text) {
+      setMessage("Ingen query å kopiere.", "error");
+      return;
+    }
+
+    // Hide fallback box on each attempt
+    const fb = document.getElementById("copyFallback");
+    fb.style.display = "none";
+    fb.value = "";
+
+    // 1) Try modern clipboard API (works in normal browser context)
+    try {
+      await navigator.clipboard.writeText(text);
+      setMessage("Kopiert.", "ok");
+      return;
+    } catch (e) {
+      // Continue to fallback
+    }
+
+    // 2) Try execCommand fallback
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      ta.style.top = "0";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+
+      if (ok) {
+        setMessage("Kopiert.", "ok");
+        return;
+      }
+    } catch (e) {
+      // Continue
+    }
+
+    // 3) Final fallback: show text selected for manual Ctrl+C (needed in some iframes)
+    fb.style.display = "block";
+    fb.value = text;
+    fb.focus();
+    fb.select();
+    setMessage("Clipboard blokkert her. Tekst er markert – trykk Ctrl+C.", "error");
+  }
+
+  function toggleAll(masterChecked) {
+    document.querySelectorAll('input[name="docs"]').forEach(b => b.checked = masterChecked);
+  }
+
+  function syncSelectAllCheckbox() {
+    const allBoxes = Array.from(document.querySelectorAll('input[name="docs"]'));
+    const checkedBoxes = allBoxes.filter(b => b.checked);
+    const selectAll = document.getElementById("select_all");
+    selectAll.checked = allBoxes.length > 0 && checkedBoxes.length === allBoxes.length;
+    selectAll.indeterminate = checkedBoxes.length > 0 && checkedBoxes.length < allBoxes.length;
+  }
+
+  function generate() {
+    setMessage("", "ok");
+    try {
+      const orders = parseOrders(document.getElementById("orders").value);
+      const selectedDocs = getSelectedDocs();
+      currentQueryFull = buildIdmQuery(orders, selectedDocs);
+
+      document.getElementById("copyBtn").disabled = false;
+      setMessage(`Klar (${orders.length} ordre, ${selectedDocs.length} typer).`, "ok");
+    } catch (e) {
+      currentQueryFull = "";
+      document.getElementById("copyBtn").disabled = true;
+      setMessage(e.message || String(e), "error");
+    }
+  }
+
+  function renderDocCheckboxes() {
+    const container = document.getElementById("docs");
+    container.innerHTML = "";
+
+    for (const key of UI_ORDER) {
+      if (!(key in DOC_TYPES)) continue;
+      const dt = DOC_TYPES[key];
+
+      const label = document.createElement("label");
+      label.innerHTML = `
+        <input type="checkbox" name="docs" value="${escapeHtml(key)}">
+        ${escapeHtml(dt.label)}
+      `;
+      container.appendChild(label);
+    }
+
+    toggleAll(true);
+    syncSelectAllCheckbox();
+
+    container.addEventListener("change", (ev) => {
+      if (ev.target && ev.target.name === "docs") syncSelectAllCheckbox();
+    });
+  }
+
+  // Init
+  document.getElementById("select_all").addEventListener("change", (e) => {
+    toggleAll(e.target.checked);
+    syncSelectAllCheckbox();
+  });
+  document.getElementById("generateBtn").addEventListener("click", generate);
+  document.getElementById("copyBtn").addEventListener("click", copyQuery);
+
+  renderDocCheckboxes();
+</script>
+
+</body>
+</html>
